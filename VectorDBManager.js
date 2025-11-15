@@ -513,6 +513,14 @@ class VectorDBManager {
     }
 
     runFullRebuildWorker(diaryName) {
+        // ✅ 防止重复启动 Worker
+        if (this.activeWorkers.has(diaryName)) {
+            console.warn(`[VectorDB] Full rebuild worker for "${diaryName}" is already running. Skipping duplicate request.`);
+            return;
+        }
+        
+        this.activeWorkers.add(diaryName); // ✅ 立即标记为活动，防止竞态条件
+        
         const worker = new Worker(path.resolve(__dirname, 'vectorizationWorker.js'), {
             workerData: {
                 task: 'fullRebuild',
@@ -537,7 +545,6 @@ class VectorDBManager {
                 console.log(`[VectorDB] Worker successfully completed full rebuild for "${message.diaryName}".`);
             } else if (message.status === 'error') {
                 console.error(`[VectorDB] Worker failed for "${message.diaryName}":`, message.error);
-                // ✅ 修复：记录失败，防止无限重试
                 this.recordFailedRebuild(message.diaryName, message.error);
             } else {
                 console.error(`[VectorDB] Worker failed to process "${message.diaryName}" with an unknown message status:`, message);
@@ -548,9 +555,12 @@ class VectorDBManager {
         worker.on('error', (error) => {
             console.error(`[VectorDB] Worker error for "${diaryName}":`, error);
             this.recordFailedRebuild(diaryName, error.message);
+            // ✅ Worker 启动失败时立即清理
+            this.activeWorkers.delete(diaryName);
         });
         
         worker.on('exit', (code) => {
+            // ✅ 确保清理（幂等操作）
             this.activeWorkers.delete(diaryName);
             if (code !== 0) {
                 console.error(`[VectorDB] Worker exited with code ${code} for "${diaryName}"`);
@@ -701,16 +711,38 @@ class VectorDBManager {
     }
 
     /**
-     * ✅ 通用原子写入方法
+     * ✅ 通用原子写入方法（Windows 兼容）
      */
     async atomicWriteFile(filePath, data) {
         const tempPath = `${filePath}.tmp`;
         try {
+            // ✅ 确保父目录存在
+            const dir = path.dirname(filePath);
+            await fs.mkdir(dir, { recursive: true });
+            
             await fs.writeFile(tempPath, data);
+            
+            // ✅ Windows 兼容：如果目标文件存在，先删除再重命名
+            // 在 Windows 上，fs.rename() 不能覆盖现有文件
+            try {
+                await fs.unlink(filePath);
+            } catch (e) {
+                // 文件不存在是正常情况，忽略 ENOENT 错误
+                if (e.code !== 'ENOENT') {
+                    throw e;
+                }
+            }
+            
             await fs.rename(tempPath, filePath);
             this.debugLog(`Atomically wrote to ${path.basename(filePath)}`);
         } catch (error) {
-            console.error(`[VectorDB] Failed to write ${filePath}:`, error);
+            console.error(`[VectorDB] Failed to write ${filePath}:`, {
+                path: tempPath,
+                dest: filePath,
+                error: error.message,
+                code: error.code
+            });
+            // 清理临时文件
             try {
                 if (await this.fileExists(tempPath)) {
                     await fs.unlink(tempPath);
@@ -773,20 +805,35 @@ class VectorDBManager {
         const { diaryName, chunksToAdd, labelsToDelete, newFileHashes } = changeset;
 
         await this.acquireLock(diaryName);
+        
+        // ✅ 定义标志，判断是否需要触发全量重建
+        let shouldTriggerFullRebuild = false;
+        
         try {
             const safeFileNameBase = Buffer.from(diaryName, 'utf-8').toString('base64url');
             const indexPath = path.join(VECTOR_STORE_PATH, `${safeFileNameBase}.bin`);
             const mapPath = path.join(VECTOR_STORE_PATH, `${safeFileNameBase}_map.json`);
             
-            const backupIndexPath = `${indexPath}.backup`;
-            const backupMapPath = `${mapPath}.backup`;
+            // ✅ 使用时间戳命名备份文件，避免冲突
+            const timestamp = Date.now();
+            const backupIndexPath = `${indexPath}.backup.${timestamp}`;
+            const backupMapPath = `${mapPath}.backup.${timestamp}`;
 
-            // 第一阶段：创建备份
+            // 第一阶段：创建备份（更安全的方式）
+            let hasBackup = false;
             try {
-                if (await this.fileExists(indexPath)) await fs.copyFile(indexPath, backupIndexPath);
-                if (await this.fileExists(mapPath)) await fs.copyFile(mapPath, backupMapPath);
+                if (await this.fileExists(indexPath)) {
+                    await fs.copyFile(indexPath, backupIndexPath);
+                    hasBackup = true;
+                    this.debugLog(`Created backup: ${path.basename(backupIndexPath)}`);
+                }
+                if (await this.fileExists(mapPath)) {
+                    await fs.copyFile(mapPath, backupMapPath);
+                    this.debugLog(`Created backup: ${path.basename(backupMapPath)}`);
+                }
             } catch (e) {
-                this.debugLog(`Backup failed (probably first creation):`, e.message);
+                this.debugLog(`Backup creation failed (probably first creation):`, e.message);
+                hasBackup = false;
             }
             
             // ✅ 从内存或文件加载索引和chunkMap
@@ -950,46 +997,96 @@ class VectorDBManager {
                 }
             }
 
-            // 第五阶段：原子性保存
-            const tempIndexPath = `${indexPath}.tmp`;
-            const tempMapPath = `${mapPath}.tmp`;
+            // 第五阶段：事务性保存（更安全的多步骤流程）
+            const timestamp2 = Date.now();
+            const tempIndexPath = `${indexPath}.tmp.${timestamp2}`;
+            const tempMapPath = `${mapPath}.tmp.${timestamp2}`;
             
-            // ✅ 确保写入完成并验证文件存在
+            let writeSuccess = false;
+            
             try {
+                // Step 1: 写入临时文件
+                this.debugLog(`Writing to temp index: ${path.basename(tempIndexPath)}`);
                 await index.writeIndex(tempIndexPath);
                 
-                // 验证索引文件是否成功创建
+                // Step 2: 验证索引文件
                 if (!await this.fileExists(tempIndexPath)) {
                     throw new Error(`Index file was not created at ${tempIndexPath}`);
                 }
-                
-                await fs.writeFile(tempMapPath, JSON.stringify(chunkMap, null, 2));
-                
-                // 验证map文件是否成功创建
-                if (!await this.fileExists(tempMapPath)) {
-                    const writeError = new Error(`Map file was not created at ${tempMapPath}`);
-                    // ✅ 增强错误日志
-                    console.error(
-                        `[VectorDB] Failed to write map file:\n` +
-                        `  Path: ${tempMapPath}\n` +
-                        `  Error: ${writeError.message}\n` +
-                        `  Stack: ${writeError.stack}`
-                    );
-                    throw writeError;
+                const indexStats = await fs.stat(tempIndexPath);
+                if (indexStats.size === 0) {
+                    throw new Error(`Index file is empty: ${tempIndexPath}`);
                 }
                 
-                // 原子性重命名
+                // Step 3: 写入map文件
+                this.debugLog(`Writing to temp map: ${path.basename(tempMapPath)}`);
+                await fs.writeFile(tempMapPath, JSON.stringify(chunkMap, null, 2));
+                
+                // Step 4: 验证map文件
+                if (!await this.fileExists(tempMapPath)) {
+                    throw new Error(`Map file was not created at ${tempMapPath}`);
+                }
+                const mapStats = await fs.stat(tempMapPath);
+                if (mapStats.size === 0) {
+                    throw new Error(`Map file is empty: ${tempMapPath}`);
+                }
+                
+                // Step 5: 所有写入成功，开始替换（Windows 兼容方式）
+                this.debugLog(`Replacing old files with new ones`);
+                
+                // 先删除旧文件（如果存在）
+                if (await this.fileExists(indexPath)) {
+                    await fs.unlink(indexPath);
+                }
+                // 重命名新文件
                 await fs.rename(tempIndexPath, indexPath);
+                
+                // 同样处理map文件
+                if (await this.fileExists(mapPath)) {
+                    await fs.unlink(mapPath);
+                }
                 await fs.rename(tempMapPath, mapPath);
+                
+                writeSuccess = true;
+                this.debugLog(`File replacement completed successfully`);
+                
             } catch (writeError) {
-                // 清理可能存在的临时文件
+                console.error(`[VectorDB] Write/replace operation failed for "${diaryName}":`, {
+                    error: writeError.message,
+                    tempIndex: tempIndexPath,
+                    tempMap: tempMapPath
+                });
+                
+                // 清理临时文件
                 try {
-                    if (await this.fileExists(tempIndexPath)) await fs.unlink(tempIndexPath);
-                    if (await this.fileExists(tempMapPath)) await fs.unlink(tempMapPath);
+                    if (await this.fileExists(tempIndexPath)) {
+                        await fs.unlink(tempIndexPath);
+                        this.debugLog(`Cleaned up temp index file`);
+                    }
+                    if (await this.fileExists(tempMapPath)) {
+                        await fs.unlink(tempMapPath);
+                        this.debugLog(`Cleaned up temp map file`);
+                    }
                 } catch (cleanupError) {
                     console.warn(`[VectorDB] Failed to cleanup temp files:`, cleanupError.message);
                 }
+                
                 throw writeError;
+            }
+            
+            // ✅ 只有在写入成功后才清理备份
+            if (writeSuccess && hasBackup) {
+                try {
+                    if (await this.fileExists(backupIndexPath)) {
+                        await fs.unlink(backupIndexPath);
+                    }
+                    if (await this.fileExists(backupMapPath)) {
+                        await fs.unlink(backupMapPath);
+                    }
+                    this.debugLog(`Cleaned up backup files`);
+                } catch (e) {
+                    console.warn(`[VectorDB] Failed to cleanup backup files:`, e.message);
+                }
             }
 
             // 第六阶段：更新manifest
@@ -999,39 +1096,70 @@ class VectorDBManager {
             // ✅ 更新内存中的引用（写入成功后）
             this.chunkMaps.set(diaryName, chunkMap);
 
-            // 成功后删除备份
-            try {
-                if (await this.fileExists(backupIndexPath)) await fs.unlink(backupIndexPath);
-                if (await this.fileExists(backupMapPath)) await fs.unlink(backupMapPath);
-            } catch (e) { /* ignore */ }
-
             this.stats.lastUpdateTime = new Date().toISOString();
             console.log(`[VectorDB] Incremental update for "${diaryName}" completed successfully.`);
             
         } catch (error) {
             console.error(`[VectorDB] Critical error during changeset application for "${diaryName}":`, error);
             
+            // ✅ 尝试从备份恢复
             const safeFileNameBase = Buffer.from(diaryName, 'utf-8').toString('base64url');
             const indexPath = path.join(VECTOR_STORE_PATH, `${safeFileNameBase}.bin`);
             const mapPath = path.join(VECTOR_STORE_PATH, `${safeFileNameBase}_map.json`);
-            const backupIndexPath = `${indexPath}.backup`;
-            const backupMapPath = `${mapPath}.backup`;
             
+            // 查找最新的备份文件（可能有多个）
+            let restored = false;
             try {
-                if (await this.fileExists(backupIndexPath)) {
-                    await fs.copyFile(backupIndexPath, indexPath);
-                    await fs.copyFile(backupMapPath, mapPath);
-                    console.log(`[VectorDB] Restored from backup for "${diaryName}"`);
+                const vectorStoreFiles = await fs.readdir(VECTOR_STORE_PATH);
+                const indexBackups = vectorStoreFiles
+                    .filter(f => f.startsWith(`${safeFileNameBase}.bin.backup.`))
+                    .sort()
+                    .reverse();
+                const mapBackups = vectorStoreFiles
+                    .filter(f => f.startsWith(`${safeFileNameBase}_map.json.backup.`))
+                    .sort()
+                    .reverse();
+                
+                if (indexBackups.length > 0 && mapBackups.length > 0) {
+                    const latestIndexBackup = path.join(VECTOR_STORE_PATH, indexBackups[0]);
+                    const latestMapBackup = path.join(VECTOR_STORE_PATH, mapBackups[0]);
+                    
+                    // 删除损坏的文件
+                    if (await this.fileExists(indexPath)) await fs.unlink(indexPath);
+                    if (await this.fileExists(mapPath)) await fs.unlink(mapPath);
+                    
+                    // 从备份恢复
+                    await fs.copyFile(latestIndexBackup, indexPath);
+                    await fs.copyFile(latestMapBackup, mapPath);
+                    
+                    console.log(`[VectorDB] Successfully restored "${diaryName}" from backup`);
+                    restored = true;
+                    
+                    // 清理备份文件
+                    for (const backup of indexBackups) {
+                        await fs.unlink(path.join(VECTOR_STORE_PATH, backup));
+                    }
+                    for (const backup of mapBackups) {
+                        await fs.unlink(path.join(VECTOR_STORE_PATH, backup));
+                    }
                 }
             } catch (restoreError) {
                 console.error(`[VectorDB] Failed to restore from backup:`, restoreError);
             }
             
+            // ✅ 如果无法恢复，标记需要全量重建
+            if (!restored) {
+                shouldTriggerFullRebuild = true;
+            }
+        } finally {
+            this.releaseLock(diaryName); // ✅ 先释放锁
+        }
+        
+        // ✅ 在锁外触发全量重建，避免死锁和重复清理问题
+        if (shouldTriggerFullRebuild) {
             console.log(`[VectorDB] Scheduling full rebuild for "${diaryName}" after failed incremental update.`);
             this.runFullRebuildWorker(diaryName);
-            shouldCleanupInFinally = false; // ✅ 添加这行！Worker 会在 exit 事件中清理
-        } finally {
-            this.releaseLock(diaryName); // ✅ 释放锁
+            // ⚠️ 注意：activeWorkers 的清理由 runFullRebuildWorker 的 exit 事件处理
         }
     }
 
