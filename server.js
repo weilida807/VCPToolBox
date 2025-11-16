@@ -512,33 +512,81 @@ app.post('/v1/interrupt', (req, res) => {
     if (context) {
         console.log(`[Interrupt] Received stop signal for ID: ${id}`);
         
-        // 新增：立即向客户端发送流式中止信号
-        if (context.res && !context.res.headersSent) {
-            // 如果响应头还没发送，发送标准JSON响应
-            try {
-                context.res.status(200).json({
-                    choices: [{
-                        index: 0,
-                        message: { role: 'assistant', content: '请求已被用户中止' },
-                        finish_reason: 'stop'
-                    }]
-                });
-            } catch (e) {
-                console.error(`[Interrupt] Error sending initial response for ${id}:`, e.message);
+        // 修复 Bug #1, #2, #3: 先设置中止标志，再触发 abort，最后才尝试写入
+        // 1. 设置中止标志，防止 chatCompletionHandler 继续写入
+        if (!context.aborted) {
+            context.aborted = true; // 标记为已中止
+            
+            // 2. 立即触发 abort 信号（中断正在进行的 fetch 请求）
+            if (context.abortController && !context.abortController.signal.aborted) {
+                context.abortController.abort();
+                console.log(`[Interrupt] AbortController.abort() called for ID: ${id}`);
             }
-        } else if (context.res && !context.res.writableEnded) {
-            // 如果是流式响应且还未结束，发送[DONE]信号并关闭流
-            try {
-                context.res.write('data: [DONE]\n\n');
-                context.res.end();
-                console.log(`[Interrupt] Sent [DONE] signal and closed stream for ID: ${id}`);
-            } catch (e) {
-                console.error(`[Interrupt] Error closing stream for ${id}:`, e.message);
-            }
+            
+            // 3. 等待一小段时间让 abort 传播（避免竞态条件）
+            setImmediate(() => {
+                // 4. 现在安全地尝试关闭响应流（如果还未关闭）
+                if (context.res && !context.res.writableEnded && !context.res.destroyed) {
+                    try {
+                        // 检查响应头是否已发送，决定如何关闭
+                        if (!context.res.headersSent) {
+                            // 修复竞态条件Bug: 根据原始请求的stream属性判断响应类型
+                            const isStreamRequest = context.req?.body?.stream === true;
+                            
+                            if (isStreamRequest) {
+                                // 流式请求：发送SSE格式的中止信号
+                                console.log(`[Interrupt] Sending SSE abort signal for stream request ${id}`);
+                                context.res.status(200);
+                                context.res.setHeader('Content-Type', 'text/event-stream');
+                                context.res.setHeader('Cache-Control', 'no-cache');
+                                context.res.setHeader('Connection', 'keep-alive');
+                                
+                                const abortChunk = {
+                                    id: `chatcmpl-interrupt-${Date.now()}`,
+                                    object: 'chat.completion.chunk',
+                                    created: Math.floor(Date.now() / 1000),
+                                    model: context.req?.body?.model || 'unknown',
+                                    choices: [{
+                                        index: 0,
+                                        delta: { content: '请求已被用户中止' },
+                                        finish_reason: 'stop'
+                                    }]
+                                };
+                                context.res.write(`data: ${JSON.stringify(abortChunk)}\n\n`);
+                                context.res.write('data: [DONE]\n\n');
+                                context.res.end();
+                            } else {
+                                // 非流式请求：发送标准JSON响应
+                                console.log(`[Interrupt] Sending JSON abort response for non-stream request ${id}`);
+                                context.res.status(200).json({
+                                    choices: [{
+                                        index: 0,
+                                        message: { role: 'assistant', content: '请求已被用户中止' },
+                                        finish_reason: 'stop'
+                                    }]
+                                });
+                            }
+                        } else if (context.res.getHeader('Content-Type')?.includes('text/event-stream')) {
+                            // 是流式响应，发送 [DONE] 信号并关闭
+                            context.res.write('data: [DONE]\n\n');
+                            context.res.end();
+                            console.log(`[Interrupt] Sent [DONE] signal and closed stream for ID: ${id}`);
+                        } else {
+                            // 其他情况，直接结束响应
+                            context.res.end();
+                            console.log(`[Interrupt] Ended response for ID: ${id}`);
+                        }
+                    } catch (e) {
+                        console.error(`[Interrupt] Error closing response for ${id}:`, e.message);
+                        // 即使写入失败也不要崩溃，只记录错误
+                    }
+                } else {
+                    console.log(`[Interrupt] Response for ${id} already closed or destroyed.`);
+                }
+            });
+        } else {
+            console.log(`[Interrupt] Request ${id} already aborted, skipping duplicate abort.`);
         }
-        
-        // 触发中止信号（这会中断后续的fetch请求）
-        context.abortController.abort();
         
         // 向中断请求的发起者返回成功响应
         res.status(200).json({ status: 'success', message: `Interrupt signal sent for request ${id}.` });
@@ -847,6 +895,7 @@ async function initialize() {
     console.log('向量数据库初始化完成。');
 
     pluginManager.setProjectBasePath(__dirname);
+    pluginManager.setVectorDBManager(vectorDBManager); // 修复：注入 vectorDBManager，避免重复创建
     
     console.log('开始加载插件...');
     await pluginManager.loadPlugins();
